@@ -7,21 +7,27 @@ GET /recordings/{recording_id}/info                      header/metadata probe
 GET /recordings/{recording_id}/frames?start=&end=        fragment extraction
 GET /jobs                                                internal coalescing state
 GET /docs                                                interactive demo
+
+Delivery contract: a ``200`` (and any WAV byte) is produced only after the
+shared upstream read has fully completed and every strong-ETag / exact-length
+check has passed. A confirmed source version change yields ``409``; an
+interrupted or otherwise unreadable source yields ``502`` - in both cases
+before the response status line is sent.
 """
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import logging
+import os
 import re
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from .config import load_settings
 from .extractor import run_extraction
-from .jobs import JobManager, JobState
+from .jobs import ClientGoneError, JobManager, JobState
 from .upstream import (
     RemoteSource,
     UpstreamError,
@@ -35,7 +41,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logger = logging.getLogger("extractor.api")
 
 RECORDING_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
-CHUNK_SIZE = 256 * 1024
+# Streaming is a paced re-send of the already verified local staging file;
+# chunk size only affects response framing, never correctness.
+SEND_CHUNK_SIZE = 256 * 1024
 
 settings = load_settings()
 manager: JobManager | None = None
@@ -51,9 +59,7 @@ async def lifespan(app: FastAPI):
     )
     manager = JobManager(
         spool_dir=settings.spool_dir,
-        runner=lambda job, publish, mark_started: run_extraction(
-            job, client, settings.source_base_url, publish, mark_started
-        ),
+        runner=lambda job: run_extraction(job, client, settings.source_base_url),
     )
     logger.info("using source %s, spool %s", settings.source_base_url, settings.spool_dir)
     try:
@@ -69,7 +75,8 @@ app = FastAPI(
     description=(
         "Extract 16-bit PCM WAV fragments from a fixed remote recording store "
         "using HTTP Range requests. Concurrent identical requests share one "
-        "upstream read, bound to a single strong ETag."
+        "upstream read, bound to a single strong ETag; a complete, verified "
+        "fragment is delivered to every waiter."
     ),
 )
 
@@ -138,6 +145,7 @@ async def info(recording_id: str) -> dict:
 
 @app.get("/recordings/{recording_id}/frames")
 async def extract_frames(
+    request: Request,
     recording_id: str,
     start_frame: int = Query(..., ge=0, alias="start"),
     end_frame: int = Query(..., ge=1, alias="end"),
@@ -146,44 +154,54 @@ async def extract_frames(
     assert manager is not None
     key = (recording_id, start_frame, end_frame)
 
-    # The waiter reference spans waiting AND streaming; it is released only
-    # when the response finishes or the client disconnects. Releasing it while
-    # the job is still RUNNING is what cancels the shared upstream read when
-    # the last client goes away.
+    # Same recording + same frame range: concurrent requests share the single
+    # runner while it is reading, and share the verified staging file once it
+    # has succeeded.
     job, joined = manager.create_or_join(key)
 
-    # Block until header validation finishes so upstream/format/version errors
-    # surface as proper HTTP statuses before any byte is sent. This wait is
-    # cancellation-aware: a disconnect here releases the waiter and may cancel
-    # the shared job.
-    await job.started_event.wait()
+    # Block until the single read has fully completed. This wait is
+    # disconnect-aware: a client that hangs up during the header/body wait
+    # releases its waiter immediately (cancelling the read only if it was the
+    # last one) and gets no response at all - other waiters are untouched.
+    try:
+        await manager.wait_until_done(job, request.is_disconnected)
+    except ClientGoneError:
+        logger.info("client disconnected while waiting for %s", key)
+        return
+
     if job.state == JobState.FAILED:
-        manager.leave(job)
+        await manager.leave(job)
         raise _map_upstream(job.error or RuntimeError("extraction failed"))
-    if job.state not in (JobState.RUNNING, JobState.SUCCEEDED):
-        manager.leave(job)
+    if job.state == JobState.CANCELLED:
+        await manager.leave(job)
+        raise HTTPException(status_code=503, detail="extraction cancelled")
+    if job.state != JobState.SUCCEEDED:  # pragma: no cover - defensive
+        await manager.leave(job)
         raise HTTPException(status_code=503, detail=f"job state is {job.state.value}")
 
-    # The relay replays buffered chunks for late subscribers, so this works
-    # identically whether the job is still running or already succeeded.
-    relay_iter = manager.stream(job)
-    assert relay_iter is not None
+    # The complete fragment is on disk and every ETag/length check passed.
+    # Only now do we commit to a 200 with a WAV body.
+    manager.begin_delivery(job)
+    try:
+        file_size = os.path.getsize(job.path)
+    except OSError as exc:  # pragma: no cover - defensive; cleanup owns unlink
+        await manager.end_delivery(job)
+        raise HTTPException(status_code=502, detail=f"staging fragment lost: {exc}")
 
     async def body():
         try:
-            # Header + audio chunks arrive from the single upstream read via
-            # the relay (live or replayed). A relay error aborts this response
-            # without ever serving a partial WAV.
-            try:
-                async for chunk in relay_iter:
+            # Each client reads the local verified staging file independently;
+            # a slow or disconnecting client never affects the others.
+            with open(job.path, "rb") as fh:
+                while True:
+                    chunk = fh.read(SEND_CHUNK_SIZE)
+                    if not chunk:
+                        break
                     yield chunk
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001 - mapped for the client
-                logger.info("relay stream aborted for %s: %s", job.key, exc)
-                raise
         finally:
-            manager.leave(job)
+            # The last download retires the job; the staging file is unlinked
+            # once every waiter/reader is gone. Nothing is cached.
+            await manager.end_delivery(job)
 
     headers = {
         "Content-Disposition": (
@@ -191,6 +209,7 @@ async def extract_frames(
         ),
         "X-Source-ETag": job.etag or "",
         "X-Coalesced": "1" if joined else "0",
+        "Content-Length": str(file_size),
     }
     return StreamingResponse(body(), media_type="audio/wav", headers=headers)
 

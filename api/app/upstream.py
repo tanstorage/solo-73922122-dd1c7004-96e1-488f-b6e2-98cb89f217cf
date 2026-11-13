@@ -142,3 +142,30 @@ class RemoteSource:
         # First fetch pins the ETag and content length for the whole extraction.
         self.info = await inspect_wav(self.fetch, self.get_size)
         return self.info
+
+    async def confirm_version_after_failure(self) -> None:
+        """Classify an interrupted read.
+
+        A mid-stream connection drop is ambiguous: it may be a plain source
+        fault or a version switch the source enforced by cutting the body (it
+        cannot send ``412`` once a ``206`` body has started). Re-issue a tiny
+        Range carrying the pinned ETag in ``If-Match``:
+
+        * ``412`` / a different strong ETag -> ``UpstreamVersionChanged``
+          (confirmed change; the endpoint maps this to 409);
+        * any other failure -> return silently so the original error stands
+          (the endpoint keeps 502 for an unreadable / cut source).
+        """
+        if self.etag is None:
+            return
+        probe_end = 63
+        if self.content_length is not None:
+            probe_end = min(probe_end, self.content_length - 1)
+        try:
+            resp = await self._range(0, probe_end)
+        except UpstreamVersionChanged:
+            raise
+        except UpstreamError:
+            return
+        # Reaching here means the pinned ETag is still current: not a swap.
+        await resp.aclose()

@@ -13,27 +13,38 @@
 | 仅支持单 `data` 块、16-bit PCM | `api/app/wav.py` 用稀疏 Range 只读头部：拒绝多 `data` 块、非 PCM、非 16-bit（返回 415） |
 | Range 读取头部和所需音频，不下载整份 | 头部检查只读 64B 起步并按需扩展；音频只请求目标字节区间 |
 | 所有读取绑定同一强 ETag | 首个 Range 响应锁定强 ETag（拒绝弱 ETag/缺失），后续请求带 `If-Match`；换版→412→整体 409，断流→整体 502，绝不返回半份 WAV |
-| 相同录音+区间并发共用一次提取 | 进程内 `JobManager` 按 `(id, start, end)` 合并；单运行者读一次，经 fan-out relay 分发给所有等待者，每人都拿到**完整**片段 |
-| 一人断连不影响他人，最后一人退出才取消远端读取 | 双引用计数：`waiters`（连接中的客户端，覆盖等待+流式）与 `readers`（暂存文件引用）。仅当 `waiters=0` 且任务仍在运行时取消上游任务 |
-| 等实际读取结束后再清理暂存 | 清理协程先等任务真正结束，再用 `Condition` 等所有 reader 释放，最后才 unlink |
-| 收尾期间新请求不能加入已取消任务，旧收尾不得误删新文件 | 任务结束即从映射摘除；新请求建**新任务**，暂存文件名带 UUID；清理只在 `dict[key] is self` 时删除自身路径 |
-| 完成后不缓存片段 | 响应结束且无 reader 后立即删除暂存；串行重复请求会重新读源（测试场景 7 验证） |
-| 并发不同片段互不影响 | 每个 key 独立任务、独立暂存、独立 relay（测试场景 8 验证） |
+| **完整读取且校验通过才返回 200 与任何 WAV 字节** | 运行者先把整段读入 UUID 暂存文件，逐块强 ETag 校验、结尾核对精确长度；全部通过任务才置 `SUCCEEDED`，端点此刻才发 200。此前任何失败都以正常状态码（502/409/…）返回，响应体不含一个 WAV 字节 |
+| 相同录音+区间并发共用一次提取 | 进程内 `JobManager` 按 `(id, start, end)` 合并；单运行者只读一次源并写一份暂存，所有等待者在读取结束后各自从同一份已校验暂存文件独立下载**完整**片段 |
+| 一人断连不影响他人，最后一人退出才取消远端读取 | `waiters` 引用计数覆盖等待与下载全程；仅当读取仍在运行且 `waiters=0` 时取消上游任务，单个等待者断开不动其他人 |
+| 等实际读取与全部下载结束后再清理暂存 | 清理协程先等运行任务真正结束，再用条件变量等 `waiters=0 且 readers=0`，最后才 unlink；失败/取消同样删除，不留可下载残件 |
+| 收尾期间新请求不能加入已取消任务，旧收尾不得误删新文件 | 失败/取消任务结束即从映射摘除；新请求建**新任务**，暂存文件名带 UUID；清理只在 `dict[key] is self` 时删除自身路径 |
+| 完成后不缓存片段 | 最后一个下载结束且无 reader 后立即删除暂存；串行重复请求会重新读源（测试场景 7 验证） |
+| 并发不同片段互不影响 | 每个 key 独立任务、独立暂存（测试场景 8 验证） |
 
-### 并发与流式架构
+### 并发与交付架构
 
 ```
  client A ─┐
  client B ─┼─► JobManager ─► 一个 Job（一个上游读取，绑定一个强 ETag）
  client C ─┘                     │
-                                 ├─ 写入 UUID 暂存文件（失败/取消后清理）
-                                 └─ Relay：每个 chunk 发布到各客户端独立队列
+                                 └─ 完整片段写入 UUID 暂存文件
+                                        （逐块 ETag 校验 + 精确长度核对）
+                                                 │
+              读取成功后，每个客户端 ◄───────────┘ 各自独立读取同一份暂存文件
+              （每人拿到完整 WAV；慢/断开的客户端互不影响）
 ```
 
-- 响应在**头部校验通过后**立即开始流式输出；校验期错误（404/409/415/422）以正常 HTTP
-  状态码返回；开始流式后的换版/断流则安全中断连接，客户端永远收不到可解析的半份 WAV。
-- relay 缓存已发布 chunk，晚加入的等待者也能按序补齐完整片段；慢消费者阻塞满队列时被
-  摘除，不会拖慢唯一的上游读取。
+- **先完整、后交付**：运行者把整段音频读完并通过全部强 ETag 与长度检查前，
+  任务保持 `RUNNING`，端点只等待、不发送状态行；成功后才统一返回 `200` + 完整 WAV。
+  因此换版（409）、断流（502）、格式不支持（415）、不存在（404）等错误都以正常
+  HTTP 状态码返回，客户端永远不可能收到可解析的半份 WAV。
+- **断流与换版的区分**：源在 `206` 响应体已开始后无法再回 `412`，只能切断连接。
+  读取中断时，提取器用锁定的 ETag 发起一次带 `If-Match` 的小 Range 复核：
+  收到 `412`/ETag 变化即判定为**换版 → 409**；否则按**源不可用/断流 → 502**。
+- **等待期断连**：等待期间对 `Request.is_disconnected()` 做有界轮询。一人断开只
+  释放自己的 `waiters`；仅当读取仍在运行且最后一人离开时才取消唯一的上游读取。
+- 暂存文件在运行任务真正结束、且 `waiters` 与 `readers` 都归零后才删除；失败/取消
+  立即清理残件，成功则在最后一个下载结束后清理，全程不缓存片段。
 
 ## 目录结构
 
@@ -45,9 +56,9 @@
 │   ├── requirements.txt
 │   └── app/
 │       ├── main.py             # FastAPI 端点、错误映射、断连生命周期
-│       ├── jobs.py             # 合并任务、引用计数、relay、暂存清理
-│       ├── extractor.py        # 单次提取运行者（头部+音频）
-│       ├── upstream.py         # httpx Range / 强 ETag / If-Match 封装
+│       ├── jobs.py             # 合并任务、waiters/readers 引用计数、暂存清理
+│       ├── extractor.py        # 单次提取运行者（完整读入暂存 + 长度核对）
+│       ├── upstream.py         # httpx Range / 强 ETag / If-Match / 失败复核
 │       ├── wav.py              # 仅 Range 的 WAV 头部校验与头部生成
 │       └── config.py
 ├── source/
@@ -56,8 +67,9 @@
 │   └── generate.py             # 无 PII 的合成 WAV 样例生成器
 └── tests/
     ├── e2e_test.py             # 12 个端到端场景
-    ├── cancel_test.py          # 最后一人断连取消上游读取
-    └── coalesce_disconnect_test.py  # 多人中一人断连，其余仍拿完整片段
+    ├── cancel_test.py          # 最后一人断连取消上游读取（读取期，无响应发出）
+    ├── coalesce_disconnect_test.py  # 多人中一人等待期断连，其余仍拿完整片段
+    └── stdlib_jobs_check.py    # 仅标准库的 JobManager 契约核对（无需 FastAPI）
 ```
 
 ## 快速开始
@@ -99,12 +111,14 @@ docker compose up --build
    `POST localhost:8080/control/recordings/nightjar/behavior`
    设 `{"delay_seconds":1.5}`，再同时开多个相同 `frames` 请求；查
    `GET localhost:8080/stats`，可见音频 Range 只有 1 次，响应头 `X-Coalesced` 仅首个为 `0`。
-3. **多人请求取消**：设 `{"chunk_delay_seconds":1}`，发起多个请求，其中一个提前中断；
-   其余请求仍收到完整 WAV；当所有客户端都断开时，`stats.bytes_served` 远小于完整大小，
-   且暂存目录被清空。
-4. **换版失败**：慢速流进行中调 version 切到 `v2`，进行中的提取整体失败、无半份 WAV；
-   之后的新请求重新绑定新 ETag 并成功。
-5. **中途断流**：设 `{"cut_after_bytes":200}`，提取请求整体失败（连接中断或 502）。
+3. **等待期一人取消，其余不受影响**：设 `{"chunk_delay_seconds":1}`，同时发起多个相同
+   `frames` 请求；在任何响应返回前让其中一个客户端断开（如 `curl` 提前退出）。其余请求
+   最终都收到完整 WAV；当所有客户端都在读取完成前离开时，`stats.bytes_served` 远小于完整
+   大小、任务被取消且暂存目录被清空（见 `tests/cancel_test.py`、`coalesce_disconnect_test.py`）。
+4. **换版失败（409）**：慢速流进行中调 version 切到 `v2`，进行中的提取整体失败、返回
+   **409 且无任何 WAV 字节**（不是半份连接中断）；之后的新请求重新绑定新 ETag 并成功。
+5. **中途断流（502）**：设 `{"cut_after_bytes":200}`，提取在读取阶段失败并返回 **502**，
+   响应体不含 WAV；暂存残件被立即删除。
 6. **不支持格式**：对 `float32`（32-bit float）或 `two_data_chunks`（两个 data 块）提取，
    得到 415。
 
@@ -122,11 +136,14 @@ SAMPLES_DIR=/tmp/samples PORT=8080 python source/server.py &
 SOURCE_BASE_URL=http://127.0.0.1:8080 SPOOL_DIR=/tmp/spool \
   uvicorn app.main:app --host 127.0.0.1 --port 8000
 
-# 端到端测试（三个套件）
+# 端到端测试（三个 HTTP 套件，需要先起 source + api）
 API_URL=http://127.0.0.1:8000 SOURCE_URL=http://127.0.0.1:8080 SPOOL_DIR=/tmp/spool \
   python tests/e2e_test.py
 python tests/cancel_test.py
 python tests/coalesce_disconnect_test.py
+
+# 仅标准库的 JobManager 契约核对（无需安装 FastAPI/httpx，也无需起服务）
+python -I tests/stdlib_jobs_check.py
 ```
 
 ## 样例数据（无个人信息）

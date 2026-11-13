@@ -1,12 +1,17 @@
 """Focused check: the last waiter's disconnect cancels the remote read,
 and the source actually observes an aborted connection (no full download).
 
-Uses the source's per-chunk delay so response headers arrive immediately but
-the audio body streams slowly, giving the client time to disconnect.
+Delivery model: the API buffers the whole verified fragment before sending a
+response, so a client that hangs up while the read is still running never
+receives a status line or any WAV byte. A large per-chunk delay makes the
+audio read slow enough to abandon it in flight; the client closes the socket
+before the extraction completes, the shared read is cancelled, and the
+staging file is removed.
 """
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 
 import httpx
@@ -20,26 +25,37 @@ async def main() -> int:
     async with httpx.AsyncClient(timeout=30.0) as c:
         await c.post(f"{SRC}/control/reset", json={})
         await c.post(f"{SRC}/control/stats/reset", json={})
-        # Headers return at once; each 8 KiB audio block then takes 1 s, so
-        # the body streams slowly enough to abandon it mid-flight.
+        # Audio body streams from the source in slow 8 KiB blocks, so the
+        # buffered extraction takes far longer than the client's patience.
         await c.post(
             f"{SRC}/control/recordings/rail/behavior",
             json={"delay_seconds": 0.0, "cut_after_bytes": 0,
                   "chunk_delay_seconds": 1.0},
         )
 
-        async def quit_early() -> None:
-            async with c.stream(
-                "GET", f"{API}/recordings/rail/frames",
-                params={"start": 0, "end": 110250},  # 220500 bytes, ~27 blocks
-            ) as r:
-                assert r.status_code == 200, r.status_code
-                # Read one chunk then abandon the sole (last) waiter.
-                first = await r.aiter_bytes().__anext__()
-                assert first[:4] == b"RIFF"
-                await r.aclose()
+        got_status: int | None = None
+        got_bytes = 0
 
-        await asyncio.wait_for(quit_early(), timeout=45)
+        async def quit_early() -> None:
+            nonlocal got_status, got_bytes
+            try:
+                async with c.stream(
+                    "GET", f"{API}/recordings/rail/frames",
+                    params={"start": 0, "end": 110250},  # 220500 bytes of audio
+                ) as r:
+                    got_status = r.status_code
+                    async for chunk in r.aiter_bytes():
+                        got_bytes += len(chunk)
+            except (httpx.ReadError, httpx.RemoteProtocolError,
+                    httpx.ConnectError, httpx.ReadTimeout):
+                # Expected: the client gives up before any response is sent.
+                pass
+
+        task = asyncio.create_task(quit_early())
+        await asyncio.sleep(3.0)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
         # Let cancellation propagate to the upstream connection and cleanup run.
         await asyncio.sleep(1.5)
 
@@ -47,13 +63,17 @@ async def main() -> int:
         stats = (await c.get(f"{SRC}/stats")).json()
         leftovers = [f for f in os.listdir(SPOOL) if "rail" in f]
 
+        print("status seen by client (None = no response at all):", got_status)
+        print("bytes received by client:", got_bytes)
         print("jobs after last-waiter disconnect (empty = fully cleaned up):", jobs)
         print("source stats:", stats)
         print("spool leftovers:", leftovers)
 
         full_size = 44 + 110250 * 2
         ok = (
-            all(j["state"] == "cancelled" for j in jobs if j["key"]["recording_id"] == "rail")
+            got_status is None
+            and got_bytes == 0
+            and not any(j["key"]["recording_id"] == "rail" for j in jobs)
             and leftovers == []
             # The remote read was aborted well before the full body transferred.
             and 0 < stats["bytes_served"] < full_size
