@@ -1,0 +1,22 @@
+services:
+  source:
+    build: ./source
+    environment:
+      # Global defaults; per-recording overrides are set at runtime via
+      # POST /control/recordings/{id}/behavior
+      DEFAULT_DELAY: "0"
+      DEFAULT_CUT_AFTER_BYTES: "0"
+    ports:
+      - "8080:8080"
+
+  api:
+    build: ./api
+    depends_on:
+      source:
+        condition: service_healthy
+    environment:
+      SOURCE_BASE_URL: "http://source:8080"
+      SPOOL_DIR: "/tmp/wav-spool"
+      REQUEST_TIMEOUT: "60"
+    ports:
+      - "8000:8000"
